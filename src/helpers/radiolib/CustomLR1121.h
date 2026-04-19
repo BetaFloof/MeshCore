@@ -1,11 +1,13 @@
 #pragma once
 
 #include <RadioLib.h>
-
+#include "MeshCore.h"
 
 class CustomLR1121 : public LR1121 {
   public:
     CustomLR1121(Module *mod) : LR1121(mod) { }
+
+    float getFreqMHz() const { return freqMHz; }
 
     bool isReceiving() {
       uint16_t irq = getIrqStatus();
