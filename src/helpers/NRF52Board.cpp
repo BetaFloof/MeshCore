@@ -1,5 +1,6 @@
 #if defined(NRF52_PLATFORM)
 #include "NRF52Board.h"
+#include <target.h>
 
 #include <bluefruit.h>
 #include <nrf_soc.h>
@@ -63,20 +64,6 @@ void NRF52Board::initPowerMgr() {
   } else {
     MESH_DEBUG_PRINTLN("PWRMGT: Reset = %s (0x%lX)",
       getResetReasonString(reset_reason), (unsigned long)reset_reason);
-  }
-}
-
-bool NRF52Board::isExternalPowered() {
-  // Check if SoftDevice is enabled before using its API
-  uint8_t sd_enabled = 0;
-  sd_softdevice_is_enabled(&sd_enabled);
-
-  if (sd_enabled) {
-    uint32_t usb_status;
-    sd_power_usbregstatus_get(&usb_status);
-    return (usb_status & POWER_USBREGSTATUS_VBUSDETECT_Msk) != 0;
-  } else {
-    return (NRF_POWER->USBREGSTATUS & POWER_USBREGSTATUS_VBUSDETECT_Msk) != 0;
   }
 }
 
@@ -251,6 +238,20 @@ void NRF52BoardDCDC::begin() {
   }
 }
 
+bool NRF52Board::isExternalPowered() {
+  // Check if SoftDevice is enabled before using its API
+  uint8_t sd_enabled = 0;
+  sd_softdevice_is_enabled(&sd_enabled);
+
+  if (sd_enabled) {
+    uint32_t usb_status;
+    sd_power_usbregstatus_get(&usb_status);
+    return (usb_status & POWER_USBREGSTATUS_VBUSDETECT_Msk) != 0;
+  } else {
+    return (NRF_POWER->USBREGSTATUS & POWER_USBREGSTATUS_VBUSDETECT_Msk) != 0;
+  }
+}
+
 void NRF52Board::sleep(uint32_t secs) {
   // Clear FPU interrupt flags to avoid insomnia
   // see errata 87 for details https://docs.nordicsemi.com/bundle/errata_nRF52840_Rev3/page/ERR/nRF52840/Rev3/latest/anomaly_840_87.html
@@ -279,22 +280,66 @@ void NRF52Board::sleep(uint32_t secs) {
 
 // Temperature from NRF52 MCU
 float NRF52Board::getMCUTemperature() {
-  NRF_TEMP->TASKS_START = 1; // Start temperature measurement
-
-  long startTime = millis();  
-  while (NRF_TEMP->EVENTS_DATARDY == 0) { // Wait for completion. Should complete in 50us
-    if(millis() - startTime > 5) {  // To wait 5ms just in case
-      NRF_TEMP->TASKS_STOP = 1;
+  uint8_t sd_enabled = 0;
+  sd_softdevice_is_enabled(&sd_enabled);
+  if (sd_enabled) {
+    uint32_t err_code;
+    int32_t temp;
+    err_code = sd_temp_get(&temp);
+    if (err_code == NRF_SUCCESS) {
+      return (float)temp * 0.25f;
+    } else {
       return NAN;
     }
+  } else {
+    NRF_TEMP->TASKS_START = 1; // Start temperature measurement
+
+    long startTime = millis();
+    while (NRF_TEMP->EVENTS_DATARDY == 0) { // Wait for completion. Should complete in 50us
+      if(millis() - startTime > 5) {  // To wait 5ms just in case
+        NRF_TEMP->TASKS_STOP = 1;
+        return NAN;
+      }
+    }
   }
-  
+
   NRF_TEMP->EVENTS_DATARDY = 0; // Clear event flag
 
   int32_t temp = NRF_TEMP->TEMP; // In 0.25 *C units
   NRF_TEMP->TASKS_STOP = 1;
 
   return temp * 0.25f; // Convert to *C
+}
+
+void NRF52Board::powerOff() {
+  // Power off the display if any
+#ifdef DISPLAY_CLASS
+  display.turnOff();
+#endif
+
+  // Power off LoRa
+  radio_driver.powerOff();
+
+  // Keep LoRa inactive during deepsleep
+  digitalWrite(P_LORA_NSS, HIGH);
+
+  // Power off GPS if any
+  if(sensors.getLocationProvider() != NULL) {
+    sensors.getLocationProvider()->stop();
+  }
+
+  // Flush serial buffers
+  Serial.flush();
+  delay(100);
+
+  // Enter SYSTEMOFF
+  uint8_t sd_enabled = 0;
+  sd_softdevice_is_enabled(&sd_enabled);
+  if (sd_enabled) { // SoftDevice is enabled
+    sd_power_system_off();
+  } else { // SoftDevice is not enable
+    NRF_POWER->SYSTEMOFF = POWER_SYSTEMOFF_SYSTEMOFF_Enter;
+  }
 }
 
 bool NRF52Board::getBootloaderVersion(char* out, size_t max_len) {
