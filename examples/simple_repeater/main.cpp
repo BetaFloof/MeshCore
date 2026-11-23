@@ -3,11 +3,6 @@
 
 #include "MyMesh.h"
 
-#ifdef DISPLAY_CLASS
-  #include "UITask.h"
-  static UITask ui_task(display);
-#endif
-
 #ifdef ETHERNET_ENABLED
   #define ETHERNET_CLI_BANNER "MeshCore Repeater CLI"
   #include <helpers/nrf52/EthernetCLI.h>
@@ -107,7 +102,7 @@ void setup() {
   the_mesh.begin(fs);
 
 #ifdef DISPLAY_CLASS
-  ui_task.begin(the_mesh.getNodePrefs(), FIRMWARE_BUILD_DATE, FIRMWARE_VERSION);
+  ui_task.begin(the_mesh.getNodePrefs(), FIRMWARE_BUILD_DATE, FIRMWARE_VERSION, "< Repeater >");
 #endif
 
 #ifdef ETHERNET_ENABLED
@@ -125,6 +120,13 @@ void setup() {
 void loop() {
   // Handle Serial CLI
   int len = strlen(command);
+  // `command` must stay NUL-terminated within its bounds. If it ever isn't,
+  // strlen() above can return >= sizeof(command) and the loop below would then
+  // index past the buffer, so clamp defensively.
+  if (len >= (int)sizeof(command)) {
+    command[0] = 0;
+    len = 0;
+  }
   while (Serial.available() && len < sizeof(command)-1) {
     char c = Serial.read();
     if (c != '\n') {
@@ -134,8 +136,9 @@ void loop() {
     }
     if (c == '\r') break;
   }
-  if (len == sizeof(command)-1) {  // command buffer full
-    command[sizeof(command)-1] = '\r';
+  if (len == sizeof(command)-1) {  // buffer full: treat as a completed line
+    command[sizeof(command)-2] = '\r';  // place end-of-line marker inside the buffer
+    command[sizeof(command)-1] = 0;     // keep the buffer NUL-terminated
   }
 
   if (len > 0 && command[len - 1] == '\r') {  // received complete line
@@ -157,6 +160,8 @@ void loop() {
     command[0] = 0;  // reset command buffer
   }
 
+  board.loop();   // let the board feed its watchdog, run periodic housekeeping
+
 #ifdef ETHERNET_ENABLED
   ethernet_loop_maintain();
   if (ethernet_read_line(ethernet_command, sizeof(ethernet_command))) {
@@ -170,7 +175,7 @@ void loop() {
   }
 #endif
 
-#if defined(PIN_USER_BTN) && defined(_SEEED_SENSECAP_SOLAR_H_)
+#if defined(PIN_USER_BTN) && defined(_SEEED_SENSECAP_SOLAR_H_) && !defined(DISPLAY_CLASS)
   // Hold the user button to power off the SenseCAP Solar repeater.
   int btnState = digitalRead(PIN_USER_BTN);
   if (btnState == LOW) {

@@ -3,7 +3,7 @@
 #define RADIOLIB_STATIC_ONLY 1
 #include <RadioLib.h>
 #include <helpers/radiolib/RadioLibWrappers.h>
-#include <helpers/MeshadventurerBoard.h>
+#include <MeshadventurerBoard.h>
 #include <helpers/radiolib/CustomSX1262Wrapper.h>
 #include <helpers/radiolib/CustomSX1268Wrapper.h>
 #include <helpers/AutoDiscoverRTCClock.h>
@@ -12,11 +12,11 @@
 #ifdef DISPLAY_CLASS
   #include <helpers/ui/SSD1306Display.h>
   #include <helpers/ui/MomentaryButton.h>
+  #include <UITask.h>
 #endif
 
 class MASensorManager : public SensorManager {
-  bool gps_active = false;
-  LocationProvider * _location;
+  LocationProvider* _location;
 
   void start_gps();
   void stop_gps();
@@ -39,9 +39,9 @@ extern MASensorManager sensors;
 #ifdef DISPLAY_CLASS
   extern DISPLAY_CLASS display;
   extern MomentaryButton user_btn;
+  extern UITask ui_task;
 #endif
 
 
 bool radio_init();
 mesh::LocalIdentity radio_new_identity();
-

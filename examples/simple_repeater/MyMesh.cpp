@@ -1,5 +1,6 @@
 #include "MyMesh.h"
 #include <algorithm>
+#include <helpers/sensors/LPPDataHelpers.h>
 
 /* ------------------------------ Config -------------------------------- */
 
@@ -41,6 +42,14 @@
   #define TXT_ACK_DELAY 200
 #endif
 
+#ifndef SENSOR_READ_INTERVAL_SECS
+  #define SENSOR_READ_INTERVAL_SECS  60
+#endif
+
+#ifndef TELEM_SUBSCRIBE_MAX_SECS
+  #define TELEM_SUBSCRIBE_MAX_SECS  3600
+#endif
+
 #define FIRMWARE_VER_LEVEL       2
 
 #define REQ_TYPE_GET_STATUS         0x01 // same as _GET_STATS
@@ -49,6 +58,9 @@
 #define REQ_TYPE_GET_ACCESS_LIST    0x05
 #define REQ_TYPE_GET_NEIGHBOURS     0x06
 #define REQ_TYPE_GET_OWNER_INFO     0x07     // FIRMWARE_VER_LEVEL >= 2
+
+#define REQ_TYPE_SUBSCRIBE           0x08
+#define REQ_TYPE_UNSUBSCRIBE         0x09
 
 #define RESP_SERVER_LOGIN_OK        0 // response to ANON_REQ
 
@@ -147,11 +159,10 @@ uint8_t MyMesh::handleLoginReq(const mesh::Identity& sender, const uint8_t* secr
 uint8_t MyMesh::handleAnonRegionsReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data) {
   if (anon_limiter.allow(rtc_clock.getCurrentTime())) {
     // request data has: {reply-path-len}{reply-path}
-    reply_path_len = *data & 63;
-    reply_path_hash_size = (*data >> 6) + 1;
-    data++;
+    reply_path_len = *data++;
+    if (!mesh::Packet::isValidPathLen(reply_path_len)) return 0;  // reject - bad encoding
 
-    memcpy(reply_path, data, ((uint8_t)reply_path_len) * reply_path_hash_size);
+    mesh::Packet::writePath(reply_path, data, reply_path_len);
     // data += (uint8_t)reply_path_len * reply_path_hash_size;
 
     memcpy(reply_data, &sender_timestamp, 4);   // prefix with sender_timestamp, like a tag
@@ -166,11 +177,10 @@ uint8_t MyMesh::handleAnonRegionsReq(const mesh::Identity& sender, uint32_t send
 uint8_t MyMesh::handleAnonOwnerReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data) {
   if (anon_limiter.allow(rtc_clock.getCurrentTime())) {
     // request data has: {reply-path-len}{reply-path}
-    reply_path_len = *data & 63;
-    reply_path_hash_size = (*data >> 6) + 1;
-    data++;
+    reply_path_len = *data++;
+    if (!mesh::Packet::isValidPathLen(reply_path_len)) return 0;  // reject - bad encoding
 
-    memcpy(reply_path, data, ((uint8_t)reply_path_len) * reply_path_hash_size);
+    mesh::Packet::writePath(reply_path, data, reply_path_len);
     // data += (uint8_t)reply_path_len * reply_path_hash_size;
 
     memcpy(reply_data, &sender_timestamp, 4);   // prefix with sender_timestamp, like a tag
@@ -186,11 +196,10 @@ uint8_t MyMesh::handleAnonOwnerReq(const mesh::Identity& sender, uint32_t sender
 uint8_t MyMesh::handleAnonClockReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data) {
   if (anon_limiter.allow(rtc_clock.getCurrentTime())) {
     // request data has: {reply-path-len}{reply-path}
-    reply_path_len = *data & 63;
-    reply_path_hash_size = (*data >> 6) + 1;
-    data++;
+    reply_path_len = *data++;
+    if (!mesh::Packet::isValidPathLen(reply_path_len)) return 0;  // reject - bad encoding
 
-    memcpy(reply_path, data, ((uint8_t)reply_path_len) * reply_path_hash_size);
+    mesh::Packet::writePath(reply_path, data, reply_path_len);
     // data += (uint8_t)reply_path_len * reply_path_hash_size;
 
     memcpy(reply_data, &sender_timestamp, 4);   // prefix with sender_timestamp, like a tag
@@ -209,6 +218,67 @@ uint8_t MyMesh::handleAnonClockReq(const mesh::Identity& sender, uint32_t sender
     return 9;   // reply length
   }
   return 0;
+}
+
+/* --------------------- Cayenne LPP helpers ----------------------------*/
+
+static float findTelemValue(const uint8_t* buf, uint8_t size, uint8_t channel, uint8_t type, float def_value) {
+  uint8_t i = 0;
+
+  while (i + 2 < size) {
+    // Get channel #
+    uint8_t ch = buf[i++];
+    // Get data type
+    uint8_t t = buf[i++];
+    uint8_t sz = LPPData::getDataSize(t);
+
+    if (ch == channel && t == type) {
+      return LPPData::getFloat(&buf[i], sz, LPPData::getMultiplier(t), LPPData::isSigned(t));
+    }
+    i += sz;  // skip
+  }
+  return def_value;   // not found
+}
+
+/* ------------------ end Cayenne LPP helpers ----------------------*/
+
+bool MyMesh::telemHasChanged(ClientInfo* c) {
+  auto buf = telemetry.getBuffer();
+  uint8_t size = telemetry.getSize();
+  uint8_t i = 0;
+  bool changed = false;
+
+  while (i + 2 < c->extra.sensor.min_deltas_len) {
+    uint8_t ch = c->extra.sensor.min_deltas[i];    // Get channel #
+    uint8_t t = c->extra.sensor.min_deltas[i + 1];     // Get data type
+    uint8_t sz = LPPData::getDataSize(t);
+
+    float min_delta = LPPData::getFloat(&c->extra.sensor.min_deltas[i + 2], sz, LPPData::getMultiplier(t), LPPData::isSigned(t));
+    float pv = LPPData::getFloat(&c->extra.sensor.prev_telem[i + 2], sz, LPPData::getMultiplier(t), LPPData::isSigned(t));
+
+    float v = findTelemValue(buf, size, ch, t, 0.0f);
+    if (abs(v - pv) > min_delta) changed = true;   // Yes, has changed
+
+    i += 2 + sz;  // skip
+  }
+  if (changed) {
+    // take snapshot of all _monitored_ telem values, for next cycle
+    i = 0;
+    while (i + 2 < c->extra.sensor.min_deltas_len) {
+      uint8_t ch = c->extra.sensor.min_deltas[i];    // Get channel #
+      uint8_t t = c->extra.sensor.min_deltas[i + 1];     // Get data type
+      uint8_t sz = LPPData::getDataSize(t);
+
+      c->extra.sensor.prev_telem[i] = ch;
+      c->extra.sensor.prev_telem[i + 1] = t;
+
+      float v = findTelemValue(buf, size, ch, t, 0.0f);
+      LPPData::putFloat(&c->extra.sensor.prev_telem[i + 2], v, sz, LPPData::getMultiplier(t), LPPData::isSigned(t));
+
+      i += 2 + sz;  // skip
+    }
+  }
+  return changed;
 }
 
 int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t *payload, size_t payload_len) {
@@ -232,8 +302,8 @@ int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t
     stats.n_recv_direct = getNumRecvDirect();
     stats.err_events = _err_flags;
     stats.last_snr = (int16_t)(radio_driver.getLastSNR() * 4);
-    stats.n_direct_dups = ((SimpleMeshTables *)getTables())->getNumDirectDups();
-    stats.n_flood_dups = ((SimpleMeshTables *)getTables())->getNumFloodDups();
+    stats.n_direct_dups = std::min<uint32_t>(((SimpleMeshTables *)getTables())->getNumDirectDups(), 0xFFFF);
+    stats.n_flood_dups = std::min<uint32_t>(((SimpleMeshTables *)getTables())->getNumFloodDups(), 0xFFFF);
     stats.total_rx_air_time_secs = getReceiveAirTime() / 1000;
     stats.n_recv_errors = radio_driver.getPacketsRecvErrors();
     memcpy(&reply_data[4], &stats, sizeof(stats));
@@ -344,7 +414,7 @@ int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t
       int results_offset = 0;
       uint8_t results_buffer[130];
       for(int index = 0; index < count && index + offset < neighbours_count; index++){
-        
+
         // stop if we can't fit another entry in results
         int entry_size = pubkey_prefix_length + 4 + 1;
         if(results_offset + entry_size > sizeof(results_buffer)){
@@ -375,6 +445,53 @@ int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t
   } else if (payload[0] == REQ_TYPE_GET_OWNER_INFO) {
     sprintf((char *) &reply_data[4], "%s\n%s\n%s", FIRMWARE_VERSION, _prefs.node_name, _prefs.owner_info);
     return 4 + strlen((char *) &reply_data[4]);
+  }
+
+  return payload_len > 0 ? handleRequest(sender, sender_timestamp, payload[0], &payload[1], payload_len - 1) : 0;
+}
+
+int MyMesh::handleRequest(ClientInfo *from, uint32_t sender_timestamp, uint8_t req_type, uint8_t *payload, size_t payload_len) {
+  uint8_t perms = from->isAdmin() ? 0xFF : from->permissions;
+
+  if (req_type == REQ_TYPE_SUBSCRIBE && payload_len >= 8 && (perms & PERM_ACL_ROLE_MASK) >= PERM_ACL_READ_ONLY) {
+    memcpy(&from->extra.sensor.push_tag, &payload[0], 4);
+    uint16_t timeout_secs;
+    memcpy(&timeout_secs, &payload[4], 2);
+    uint8_t  reserved = payload[6];
+    uint8_t  min_deltas_len = payload[7];
+    RegionEntry* r;
+    if (recv_pkt_region && !recv_pkt_region->isWildcard()) {   // use request scope
+      r = recv_pkt_region;
+    } else {   // use default scope
+      r = region_map.getDefaultRegion();
+    }
+    uint8_t reply_len;
+    if (r && min_deltas_len >= 3 && min_deltas_len <= sizeof(from->extra.sensor.min_deltas)) {
+      if (timeout_secs > TELEM_SUBSCRIBE_MAX_SECS) timeout_secs = TELEM_SUBSCRIBE_MAX_SECS;  // impose max
+      from->extra.sensor.scope_region_id = r->id;
+      from->extra.sensor.expiry_timestamp = getRTCClock()->getCurrentTime() + timeout_secs;
+      from->extra.sensor.min_deltas_len = min_deltas_len;
+      memcpy(from->extra.sensor.min_deltas, &payload[8], min_deltas_len);
+      // reply with actual expiry seconds (we could modify/impose restriction)
+      memcpy(&reply_data[4], &timeout_secs, 2);
+      memset(&reply_data[6], 0, 2);  // reserved
+      strcpy((char *)&reply_data[8], r ? r->name : "");  // reply with name of scope that will be used
+      reply_len = 8 + strlen((char *)&reply_data[8]);
+    } else {
+      memset(&reply_data[4], 0, 4);  // expiry secs (0 for error)
+      reply_len = 8;
+    }
+    return reply_len;
+  }
+  if (req_type == REQ_TYPE_UNSUBSCRIBE && (perms & PERM_ACL_ROLE_MASK) >= PERM_ACL_READ_ONLY) {
+    from->extra.sensor.scope_region_id = 0;
+    from->extra.sensor.push_tag = 0;
+    from->extra.sensor.expiry_timestamp = 0;
+    from->extra.sensor.min_deltas_len = 0;
+    // REVISIT: maybe return some stats, eg total number of telemetry pushes since SUBSCRIBE?
+    memset(&reply_data[4], 0, 8);  // success
+    getRNG()->random(&reply_data[12], 2);   // just some entropy for better packet-hash uniqueness
+    return 12 + 2;
   }
   return 0; // unknown command
 }
@@ -414,24 +531,31 @@ bool MyMesh::isLooped(const mesh::Packet* packet, const uint8_t max_counters[]) 
 }
 
 void MyMesh::sendFloodReply(mesh::Packet* packet, unsigned long delay_millis, uint8_t path_hash_size) {
-  if (recv_pkt_region && !recv_pkt_region->isWildcard()) {  // if _request_ packet scope is known, send reply with same scope
-    TransportKey scope;
-    if (region_map.getTransportKeysFor(*recv_pkt_region, &scope, 1) > 0) {
-      sendFloodScoped(scope, packet, delay_millis, path_hash_size);
-    } else {
+  TransportKey req_scope;
+  bool is_wildcard = recv_pkt_region != NULL && recv_pkt_region->isWildcard();
+  bool req_scope_known = recv_pkt_region != NULL && !is_wildcard
+                      && region_map.getTransportKeysFor(*recv_pkt_region, &req_scope, 1) > 0;
+
+  switch (mesh::chooseReplyScope(req_scope_known, is_wildcard, !default_scope.isNull())) {
+    case mesh::REPLY_SCOPE_REQUEST:
+      sendFloodScoped(req_scope, packet, delay_millis, path_hash_size);   // reply with same scope as request
+      break;
+    case mesh::REPLY_SCOPE_DEFAULT:
+      // requester's scope is unknown: DIRECT request (no transport codes), or code matched no Region.
+      // un-scoped would be dropped at hop 0 by repeaters running flood.max.unscoped=0
+      sendFloodScoped(default_scope, packet, delay_millis, path_hash_size);
+      break;
+    case mesh::REPLY_SCOPE_NONE:
       sendFlood(packet, delay_millis, path_hash_size);  // send un-scoped
-    }
-  } else {
-    sendFlood(packet, delay_millis, path_hash_size);  // send un-scoped
+      break;
   }
 }
 
 bool MyMesh::allowPacketForward(const mesh::Packet *packet) {
   if (_prefs.disable_fwd) return false;
-  if (packet->isRouteFlood()) {
-    if (packet->getPathHashCount() >= _prefs.flood_max) return false;
-    if (packet->getRouteType() == ROUTE_TYPE_FLOOD && packet->getPathHashCount() >= _prefs.flood_max_unscoped) return false;
-    if (packet->getPayloadType() == PAYLOAD_TYPE_ADVERT && packet->getPathHashCount() >= _prefs.flood_max_advert) return false;
+  if (packet->isRouteFlood()
+      && mesh::isFloodHopLimitExceeded(packet, _prefs.flood_max, _prefs.flood_max_unscoped, _prefs.flood_max_advert)) {
+    return false;
   }
   if (packet->isRouteFlood() && recv_pkt_region == NULL) {
     MESH_DEBUG_PRINTLN("allowPacketForward: unknown transport code, or wildcard not allowed for FLOOD packet");
@@ -574,7 +698,7 @@ void MyMesh::onAnonDataRecv(mesh::Packet *packet, const uint8_t *secret, const m
     data[len] = 0;  // ensure null terminator
     uint8_t reply_len;
 
-    reply_path_len = -1;
+    reply_path_len = 0xFF;
     if (data[4] == 0 || data[4] >= ' ') {   // is password, ie. a login request
       reply_len = handleLoginReq(sender, secret, timestamp, &data[4], packet->isRouteFlood());
     } else if (data[4] == ANON_REQ_TYPE_REGIONS && packet->isRouteDirect()) {
@@ -589,18 +713,29 @@ void MyMesh::onAnonDataRecv(mesh::Packet *packet, const uint8_t *secret, const m
 
     if (reply_len == 0) return;   // invalid request
 
-    if (packet->isRouteFlood()) {
+    // a DIRECT login can reply via the stored out_path, as onPeerDataRecv() does for REQ
+    ClientInfo* client = acl.getClient(sender.pub_key, PUB_KEY_SIZE);
+    bool have_out_path = client != NULL && client->out_path_len != OUT_PATH_UNKNOWN;
+
+    auto route = mesh::chooseReplyRoute(packet->isRouteFlood(), reply_path_len != 0xFF, have_out_path);
+
+    if (route == mesh::REPLY_ROUTE_PATH_RETURN) {
       // let this sender know path TO here, so they can use sendDirect(), and ALSO encode the response
       mesh::Packet* path = createPathReturn(sender, secret, packet->path, packet->path_len,
                                             PAYLOAD_TYPE_RESPONSE, reply_data, reply_len);
       if (path) sendFloodReply(path, SERVER_RESPONSE_DELAY, packet->getPathHashSize());
-    } else if (reply_path_len < 0) {
-      mesh::Packet* reply = createDatagram(PAYLOAD_TYPE_RESPONSE, sender, secret, reply_data, reply_len);
-      if (reply) sendFloodReply(reply, SERVER_RESPONSE_DELAY, packet->getPathHashSize());
+      return;
+    }
+
+    mesh::Packet* reply = createDatagram(PAYLOAD_TYPE_RESPONSE, sender, secret, reply_data, reply_len);
+    if (reply == NULL) return;
+
+    if (route == mesh::REPLY_ROUTE_DIRECT_SUPPLIED) {
+      sendDirect(reply, reply_path, reply_path_len, SERVER_RESPONSE_DELAY);
+    } else if (route == mesh::REPLY_ROUTE_DIRECT_OUT_PATH) {
+      sendDirect(reply, client->out_path, client->out_path_len, SERVER_RESPONSE_DELAY);
     } else {
-      mesh::Packet* reply = createDatagram(PAYLOAD_TYPE_RESPONSE, sender, secret, reply_data, reply_len);
-      uint8_t path_len = ((reply_path_hash_size - 1) << 6) | (reply_path_len & 63);
-      if (reply) sendDirect(reply, reply_path,  path_len, SERVER_RESPONSE_DELAY);
+      sendFloodReply(reply, SERVER_RESPONSE_DELAY, packet->getPathHashSize());
     }
   }
 }
@@ -689,7 +824,7 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
     memcpy(&sender_timestamp, data, 4); // timestamp (by sender's RTC clock - which could be wrong)
     uint8_t flags = (data[4] >> 2);        // message attempt number, and other flags
 
-    if (!(flags == TXT_TYPE_PLAIN || flags == TXT_TYPE_CLI_DATA)) {
+    if (!(flags == TXT_TYPE_PLAIN || flags == TXT_TYPE_CLI_DATA || flags == TXT_TYPE_CLI_COMMAND)) {
       MESH_DEBUG_PRINTLN("onPeerDataRecv: unsupported text type received: flags=%02x", (uint32_t)flags);
     } else if (sender_timestamp >= client->last_timestamp) { // prevent replay attacks
       bool is_retry = (sender_timestamp == client->last_timestamp);
@@ -715,7 +850,8 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
         }
       }
 
-      uint8_t temp[166];
+      // 5-byte datagram header + 3-byte reflected CLI prefix + 160-byte reply text + NUL
+      uint8_t temp[169];
       char *command = (char *)&data[5];
       char *reply = (char *)&temp[5];
       if (is_retry) {
@@ -775,6 +911,7 @@ void MyMesh::onControlDataRecv(mesh::Packet* packet) {
   uint8_t type = packet->payload[0] & 0xF0;    // just test upper 4 bits
   if (type == CTL_TYPE_NODE_DISCOVER_REQ && packet->payload_len >= 6
       && !_prefs.disable_fwd && discover_limiter.allow(rtc_clock.getCurrentTime())
+      && !isHiddenNode()   // this node wishes to NOT be discoverable
   ) {
     int i = 1;
     uint8_t  filter = packet->payload[i++];
@@ -862,6 +999,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   uptime_millis = 0;
   next_local_advert = next_flood_advert = 0;
   dirty_contacts_expiry = 0;
+  last_read_time = 0;
   set_radio_at = revert_radio_at = 0;
   _logging = false;
   region_load_active = false;
@@ -872,7 +1010,6 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
 #endif
 
   // defaults
-  memset(&_prefs, 0, sizeof(_prefs));
   _prefs.airtime_factor = 1.0;
   _prefs.rx_delay_base = 0.0f;   // turn off by default, was 10.0;
   _prefs.tx_delay_factor = 0.5f; // was 0.25f
@@ -893,6 +1030,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   _prefs.flood_max_advert = 8;
   _prefs.interference_threshold = 0; // disabled
   _prefs.cad_enabled = 0;            // hardware CAD before TX (off by default; 'set cad on')
+  _prefs.loop_detect = LOOP_DETECT_MINIMAL;
 
   // bridge defaults
   _prefs.bridge_enabled = 1;    // enabled
@@ -918,6 +1056,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
 #endif
 #endif
   _prefs.radio_fem_rxgain = 1;
+  _prefs.radio_fem_txgain = 0;
 
   pending_discover_tag = 0;
   pending_discover_until = 0;
@@ -966,7 +1105,8 @@ void MyMesh::begin(FILESYSTEM *fs) {
   radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain);
   MESH_DEBUG_PRINTLN("RX Boosted Gain Mode: %s",
                      radio_driver.getRxBoostedGainMode() ? "Enabled" : "Disabled");
-  board.setLoRaFemLnaEnabled(_prefs.radio_fem_rxgain);
+
+  board.attachDynamicPrefs(_prefs.getCustom());
 
   updateAdvertTimer();
   updateFloodAdvertTimer();
@@ -1065,6 +1205,12 @@ bool MyMesh::setRxBoostedGain(bool enable) {
   return radio_driver.setRxBoostedGainMode(enable);
 }
 
+#if defined(USE_LR2021)
+bool MyMesh::configSideDetectors(const uint8_t sideDetSFs[], uint8_t num, float bw) {
+  return radio_driver.configSideDetectors(sideDetSFs, num, bw);
+}
+#endif
+
 void MyMesh::formatNeighborsReply(char *reply) {
   char *dp = reply;
 
@@ -1148,7 +1294,7 @@ void MyMesh::formatRadioStatsReply(char *reply) {
 }
 
 void MyMesh::formatPacketStatsReply(char *reply) {
-  StatsFormatHelper::formatPacketStats(reply, radio_driver, getNumSentFlood(), getNumSentDirect(), 
+  StatsFormatHelper::formatPacketStats(reply, radio_driver, getNumSentFlood(), getNumSentDirect(),
                                        getNumRecvFlood(), getNumRecvDirect());
 }
 
@@ -1293,6 +1439,49 @@ void MyMesh::loop() {
     revert_radio_at = 0;                                        // clear timer
     radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
     MESH_DEBUG_PRINTLN("Radio params restored");
+  }
+
+  uint32_t curr = getRTCClock()->getCurrentTime();
+  if (curr >= last_read_time + SENSOR_READ_INTERVAL_SECS) {
+    telemetry.reset();
+    telemetry.addVoltage(TELEM_CHANNEL_SELF, (float)board.getBattMilliVolts() / 1000.0f);
+    // query other sensors -- target specific
+    sensors.querySensors(0xFF, telemetry);  // allow all telemetry permissions
+  	// This MCU temperature will be overridden by external sensors (if any)
+    float temperature = board.getMCUTemperature();
+    if (!isnan(temperature)) {   // Supported boards with built-in temperature sensor. ESP32-C3 may return NAN
+      telemetry.addTemperature(TELEM_CHANNEL_SELF, temperature);    // Built-in MCU Temperature
+    }
+
+    // compare with previous telemetry, check if any deltas are greater than subscriber minimums
+    for (int i = 0; i < acl.getNumClients(); i++) {
+      auto c = acl.getClientByIdx(i);
+      if (c->permissions == 0 || c->extra.sensor.scope_region_id == 0 || c->extra.sensor.min_deltas_len == 0) continue;  // skip deleted entries, or Not subscribed to deltas
+      RegionEntry* r = region_map.findById(c->extra.sensor.scope_region_id);
+      if (r == NULL) continue;   // unknown region scope
+      if (curr > c->extra.sensor.expiry_timestamp) continue;  // subscription now expired
+      if (telemHasChanged(c)) {
+        TransportKey scope;
+        if (region_map.getTransportKeysFor(*r, &scope, 1) > 0) {
+          uint8_t tlen = telemetry.getSize();
+          memcpy(reply_data, &c->extra.sensor.push_tag, 4);
+          uint32_t timestamp = getRTCClock()->getCurrentTimeUnique();
+          memcpy(&reply_data[4], &timestamp, 4);
+          memcpy(&reply_data[8], telemetry.getBuffer(), tlen);
+
+          mesh::Packet* reply = createDatagram(PAYLOAD_TYPE_RESPONSE, c->id, c->shared_secret, reply_data, 8 + tlen);
+          if (reply) {
+            if (c->out_path_len != OUT_PATH_UNKNOWN) {  // we have an out_path, so send DIRECT
+              sendDirect(reply, c->out_path, c->out_path_len, 0);
+            } else {
+              sendFloodScoped(scope, reply, 0, _prefs.path_hash_mode + 1);
+            }
+          }
+        }
+      }
+    }
+
+    last_read_time = curr;
   }
 
   // is pending dirty contacts write needed?

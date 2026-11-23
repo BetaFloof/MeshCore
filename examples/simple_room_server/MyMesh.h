@@ -3,7 +3,7 @@
 #include <Arduino.h>   // needed for PlatformIO
 #include <Mesh.h>
 
-#if defined(NRF52_PLATFORM)
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
   #include <InternalFileSystem.h>
 #elif defined(RP2040_PLATFORM)
   #include <LittleFS.h>
@@ -21,17 +21,18 @@
 #include <helpers/StatsFormatHelper.h>
 #include <helpers/ClientACL.h>
 #include <helpers/RegionMap.h>
+#include <helpers/RoutingPolicy.h>
 #include <RTClib.h>
 #include <target.h>
 
 /* ------------------------------ Config -------------------------------- */
 
 #ifndef FIRMWARE_BUILD_DATE
-  #define FIRMWARE_BUILD_DATE   "6 Jun 2026"
+  #define FIRMWARE_BUILD_DATE   "15 Oct 2026"
 #endif
 
 #ifndef FIRMWARE_VERSION
-  #define FIRMWARE_VERSION   "v1.16.0"
+  #define FIRMWARE_VERSION   "v1.18.0"
 #endif
 
 #ifndef LORA_FREQ
@@ -76,8 +77,6 @@
   #define TXT_ACK_DELAY     200
 #endif
 
-#define FIRMWARE_ROLE "room_server"
-
 #define PACKET_LOG_FILE  "/packet_log"
 
 #define MAX_POST_TEXT_LEN    (160-9)
@@ -119,6 +118,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   int  matching_peer_indexes[MAX_CLIENTS];
 
   void addPost(ClientInfo* client, const char* postData);
+  void storePost(const mesh::Identity& author, const char* postData);
   void pushPostToClient(ClientInfo* client, PostInfo& post);
   uint8_t getUnsyncedCount(ClientInfo* client);
   bool processAck(const uint8_t *data);
@@ -166,7 +166,14 @@ protected:
 
 #if ENV_INCLUDE_GPS == 1
   void applyGpsPrefs() {
-    sensors.setSettingValue("gps", _prefs.gps_enabled?"1":"0");
+    if (sensors.getSettingByKey("gps_interval") != nullptr) {
+      // gps_interval was introduced only for EnvironmentSensorManager
+      // and has little interest ... kept only as a legacy
+      char interval[11];
+      snprintf(interval, sizeof(interval), "%lu", (unsigned long)_prefs.gps_interval);
+      sensors.setSettingValue("gps_interval", interval);
+    }
+    _prefs.getGpsPrefs()->apply(sensors);
   }
 #endif
 
@@ -176,10 +183,11 @@ public:
   MyMesh(mesh::MainBoard& board, mesh::Radio& radio, mesh::MillisecondClock& ms, mesh::RNG& rng, mesh::RTCClock& rtc, mesh::MeshTables& tables);
 
   void begin(FILESYSTEM* fs);
+  void addSystemPost(const char* postData);
 
   const char* getFirmwareVer() override { return FIRMWARE_VERSION; }
   const char* getBuildDate() override { return FIRMWARE_BUILD_DATE; }
-  const char* getRole() override { return FIRMWARE_ROLE; }
+  const char* getRole() override { return "room_server"; }
   const char* getNodeName() { return _prefs.node_name; }
   NodePrefs* getNodePrefs() {
     return &_prefs;
@@ -206,6 +214,7 @@ public:
 
   void dumpLogFile() override;
   void setTxPower(int8_t power_dbm) override;
+  bool setRxBoostedGain(bool enable) override;
 
   void formatNeighborsReply(char *reply) override {
     strcpy(reply, "not supported");

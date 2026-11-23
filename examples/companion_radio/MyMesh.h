@@ -2,17 +2,16 @@
 
 #include <Arduino.h>
 #include <Mesh.h>
-#include "AbstractUITask.h"
 
 /*------------ Frame Protocol --------------*/
-#define FIRMWARE_VER_CODE 13
+#define FIRMWARE_VER_CODE 14
 
 #ifndef FIRMWARE_BUILD_DATE
-#define FIRMWARE_BUILD_DATE "6 Jun 2026"
+#define FIRMWARE_BUILD_DATE "15 Oct 2026"
 #endif
 
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "v1.16.0"
+#define FIRMWARE_VERSION "v1.18.0"
 #endif
 
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
@@ -24,7 +23,7 @@
 #endif
 
 #include "DataStore.h"
-#include "NodePrefs.h"
+#include <helpers/CompanionNodePrefs.h>
 
 #include <RTClib.h>
 #include <helpers/ArduinoHelpers.h>
@@ -69,6 +68,7 @@
 
 #include <helpers/BaseChatMesh.h>
 #include <helpers/TransportKeyStore.h>
+#include <helpers/MeshEventListener.h>
 
 /* -------------------------------------------------------------------------------------- */
 
@@ -86,26 +86,35 @@ struct AdvertPath {
 
 class MyMesh : public BaseChatMesh, public DataStoreHost {
 public:
-  MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMeshTables &tables, DataStore& store, AbstractUITask* ui=NULL);
+  MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMeshTables &tables, DataStore& store);
 
-  void begin(bool has_display);
+  void begin();
   void startInterface(BaseSerialInterface &serial);
+  void setListener(MeshEventListener* listener) { _listener = listener; }
 
   const char *getNodeName();
   NodePrefs *getNodePrefs();
   uint32_t getBLEPin();
+  void setBLEPin(uint32_t active_pin);
 
   void loop();
   void handleCmdFrame(size_t len);
-  bool advert();
-  void enterCLIRescue();
 
-  int  getRecentlyHeard(AdvertPath dest[], int max_num);
+  void enterCLIRescue() override;
+  void savePrefs() override {
+    _prefs.node_lat = sensors.node_lat;
+    _prefs.node_lon = sensors.node_lon;
+    _store->savePrefs(_prefs);
+    _prefs.clearDirty();
+  }
 
 protected:
   float getAirtimeBudgetFactor() const override;
   int getInterferenceThreshold() const override;
   bool getCADEnabled() const override;
+  int getAGCResetInterval() const override {
+    return ((int)_prefs.agc_reset_interval) * 4000;   // milliseconds
+  }
   int calcRxDelay(float score, uint32_t air_time) const override;
   uint32_t getRetransmitDelay(const mesh::Packet *packet) override;
   uint32_t getDirectRetransmitDelay(const mesh::Packet *packet) override;
@@ -135,6 +144,8 @@ protected:
                      const char *text) override;
   void onCommandDataRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp,
                          const char *text) override;
+  void onCLICommandRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp,
+                         const char *text, char* reply) override;
   void onSignedMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp,
                            const uint8_t *sender_prefix, const char *text) override;
   void onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packet *pkt, uint32_t timestamp,
@@ -165,16 +176,15 @@ protected:
   }
 
 public:
-  void savePrefs() { _store->savePrefs(_prefs, sensors.node_lat, sensors.node_lon); }
-
 #if ENV_INCLUDE_GPS == 1
   void applyGpsPrefs() {
-    sensors.setSettingValue("gps", _prefs.gps_enabled ? "1" : "0");
-    if (_prefs.gps_interval > 0) {
-      char interval_str[12];  // Max: 24 hours = 86400 seconds (5 digits + null)
-      sprintf(interval_str, "%u", _prefs.gps_interval);
-      sensors.setSettingValue("gps_interval", interval_str);
+    if (_prefs.gps_interval > 0 &&
+        sensors.getSettingByKey("gps_interval") != nullptr) {
+      char interval[11];
+      snprintf(interval, sizeof(interval), "%lu", (unsigned long)_prefs.gps_interval);
+      sensors.setSettingValue("gps_interval", interval);
     }
+    _prefs.getGpsPrefs()->apply(sensors);
   }
 #endif
 
@@ -197,6 +207,7 @@ private:
   }
 
   void checkCLIRescueCmd();
+  bool handleCommand(const char* text, uint32_t sender_timestamp, char* reply);
   void checkSerialInterface();
   bool isValidClientRepeatFreq(uint32_t f) const;
 
@@ -211,7 +222,7 @@ private:
   uint32_t pending_telemetry, pending_discovery;   // pending _TELEMETRY_REQ
   uint32_t pending_req;   // pending _BINARY_REQ
   BaseSerialInterface *_serial;
-  AbstractUITask* _ui;
+  MeshEventListener* _listener;
 
   ContactsIterator _iter;
   uint32_t _iter_filter_since;
@@ -221,6 +232,7 @@ private:
   bool _cli_rescue;
   bool send_unscoped;   // force un-scoped flood (instead of using send_scope)
   char cli_command[80];
+  char reply_buf[166];
   uint8_t app_target_ver;
   uint8_t *sign_data;
   uint32_t sign_data_len;

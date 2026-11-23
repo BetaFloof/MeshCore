@@ -8,11 +8,6 @@
   #include <helpers/nrf52/EthernetCLI.h>
 #endif
 
-#ifdef DISPLAY_CLASS
-  #include "UITask.h"
-  static UITask ui_task(display);
-#endif
-
 StdRNG fast_rng;
 SimpleMeshTables tables;
 MyMesh the_mesh(board, radio_driver, *new ArduinoMillis(), fast_rng, rtc_clock, tables);
@@ -50,7 +45,7 @@ void setup() {
   fast_rng.begin(radio_driver.getRngSeed());
 
   FILESYSTEM* fs;
-#if defined(NRF52_PLATFORM)
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
   InternalFS.begin();
   fs = &InternalFS;
   IdentityStore store(InternalFS, "");
@@ -88,7 +83,7 @@ void setup() {
   the_mesh.begin(fs);
 
 #ifdef DISPLAY_CLASS
-  ui_task.begin(the_mesh.getNodePrefs(), FIRMWARE_BUILD_DATE, FIRMWARE_VERSION);
+  ui_task.begin(the_mesh.getNodePrefs(), FIRMWARE_BUILD_DATE, FIRMWARE_VERSION, "< Room Server >");
 #endif
 
 #ifdef ETHERNET_ENABLED
@@ -105,6 +100,13 @@ void setup() {
 
 void loop() {
   int len = strlen(command);
+  // `command` must stay NUL-terminated within its bounds. If it ever isn't,
+  // strlen() above can return >= sizeof(command) and the loop below would then
+  // index past the buffer, so clamp defensively.
+  if (len >= (int)sizeof(command)) {
+    command[0] = 0;
+    len = 0;
+  }
   while (Serial.available() && len < sizeof(command)-1) {
     char c = Serial.read();
     if (c != '\n') {
@@ -113,8 +115,9 @@ void loop() {
     }
     Serial.print(c);
   }
-  if (len == sizeof(command)-1) {  // command buffer full
-    command[sizeof(command)-1] = '\r';
+  if (len == sizeof(command)-1) {  // buffer full: treat as a completed line
+    command[sizeof(command)-2] = '\r';  // place end-of-line marker inside the buffer
+    command[sizeof(command)-1] = 0;     // keep the buffer NUL-terminated
   }
 
   if (len > 0 && command[len - 1] == '\r') {  // received complete line
@@ -154,6 +157,7 @@ void loop() {
   ui_task.loop();
 #endif
   rtc_clock.tick();
+  board.loop();
 #ifdef HAS_EXTERNAL_WATCHDOG
   external_watchdog.loop();
 #endif
