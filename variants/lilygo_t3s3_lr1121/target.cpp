@@ -1,11 +1,10 @@
 #include <Arduino.h>
 #include "target.h"
 
-ESP32Board board;
+LilygoT3S3LR1121Board board;
 
 static SPIClass spi;
 RADIO_CLASS radio = new Module(P_LORA_NSS, P_LORA_DIO_9, P_LORA_RESET, P_LORA_BUSY, spi);
-
 WRAPPER_CLASS radio_driver(radio, board);
 
 ESP32RTCClock fallback_clock;
@@ -58,7 +57,7 @@ bool radio_init() {
     Serial.println(status);
     return false;  // fail
   }
-  
+
   radio.setCRC(2);
   radio.explicitHeader();
 
